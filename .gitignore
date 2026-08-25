@@ -1,0 +1,12 @@
+/build/
+
+*.pcap
+*.pcapng
+*.log
+*.pid
+*.sock
+*.ipc
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
