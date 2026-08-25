@@ -76,6 +76,12 @@ class FakeResource:
         self.terminated += 1
 
 
+class FailingResource(FakeResource):
+    def stop(self):
+        super().stop()
+        raise RuntimeError("injected resource stop failure")
+
+
 class FakeSwitch(FakeResource):
     def __init__(self, name):
         super().__init__(name)
@@ -98,9 +104,11 @@ class FailingStopNetwork:
 class FakeTemporaryDirectory:
     def __init__(self):
         self.cleaned = False
+        self.cleanup_count = 0
 
     def cleanup(self):
         self.cleaned = True
+        self.cleanup_count += 1
 
 
 class TopologyContractTest(unittest.TestCase):
@@ -349,6 +357,7 @@ class CleanupTest(unittest.TestCase):
         self.assertIsNone(runtime.net)
         self.assertIsNone(runtime._runtime_dir)
         self.assertTrue(runtime_dir.cleaned)
+        self.assertEqual(runtime_dir.cleanup_count, 1)
         self.assertEqual(net.links[0].stopped, 1)
         for switch in net.switches:
             self.assertEqual(switch.process_stopped, 2)
@@ -357,6 +366,36 @@ class CleanupTest(unittest.TestCase):
         for host in net.hosts:
             self.assertEqual(host.terminated, 1)
         runtime.close()
+        self.assertEqual(runtime_dir.cleanup_count, 1)
+
+    def test_fallback_failure_still_clears_runtime_state(self):
+        runtime = SourceRoutingNetwork("controller", "p4info", "device-config")
+        net = FailingStopNetwork()
+        net.links[0] = FailingResource("link")
+        runtime_dir = FakeTemporaryDirectory()
+        runtime.net = net
+        runtime._runtime_dir = runtime_dir
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Mininet cleanup failed after injected Mininet stop failure: "
+            "stop link: injected resource stop failure",
+        ):
+            runtime.close()
+
+        self.assertIsNone(runtime.net)
+        self.assertIsNone(runtime._runtime_dir)
+        self.assertTrue(runtime_dir.cleaned)
+        self.assertEqual(runtime_dir.cleanup_count, 1)
+        self.assertEqual(net.links[0].stopped, 1)
+        for switch in net.switches:
+            self.assertEqual(switch.process_stopped, 2)
+            self.assertEqual(switch.stopped, 1)
+            self.assertEqual(switch.terminated, 1)
+        for host in net.hosts:
+            self.assertEqual(host.terminated, 1)
+        runtime.close()
+        self.assertEqual(runtime_dir.cleanup_count, 1)
 
 
 if __name__ == "__main__":

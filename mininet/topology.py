@@ -426,41 +426,44 @@ class SourceRoutingNetwork:
         return self._run_controller(verify_only=True)
 
     def close(self):
-        if self.net is not None:
-            net = self.net
-            for switch in net.switches:
-                try:
-                    switch._stop_process()
-                except BaseException:
-                    pass
-            try:
-                net.stop()
-            except BaseException as stop_error:
-                recovery_errors = []
-
-                def recover(description, operation):
-                    try:
-                        operation()
-                    except BaseException as error:
-                        recovery_errors.append(f"{description}: {error}")
-
-                for link in net.links:
-                    recover("stop link", link.stop)
+        net = self.net
+        self.net = None
+        runtime_dir = self._runtime_dir
+        self._runtime_dir = None
+        try:
+            if net is not None:
                 for switch in net.switches:
-                    recover(f"stop {switch.name} process", switch._stop_process)
-                    recover(f"stop {switch.name}", switch.stop)
-                    recover(f"terminate {switch.name}", switch.terminate)
-                for host in net.hosts:
-                    recover(f"terminate {host.name}", host.terminate)
-                if recovery_errors:
-                    detail = "; ".join(recovery_errors)
-                    raise RuntimeError(
-                        f"Mininet cleanup failed after {stop_error}: {detail}"
-                    ) from stop_error
-            self.net = None
-        if self._runtime_dir is not None:
-            self._runtime_dir.cleanup()
-            self._runtime_dir = None
+                    try:
+                        switch._stop_process()
+                    except BaseException:
+                        pass
+                try:
+                    net.stop()
+                except BaseException as stop_error:
+                    recovery_errors = []
+
+                    def recover(description, operation):
+                        try:
+                            operation()
+                        except BaseException as error:
+                            recovery_errors.append(f"{description}: {error}")
+
+                    for link in net.links:
+                        recover("stop link", link.stop)
+                    for switch in net.switches:
+                        recover(f"stop {switch.name} process", switch._stop_process)
+                        recover(f"stop {switch.name}", switch.stop)
+                        recover(f"terminate {switch.name}", switch.terminate)
+                    for host in net.hosts:
+                        recover(f"terminate {host.name}", host.terminate)
+                    if recovery_errors:
+                        detail = "; ".join(recovery_errors)
+                        raise RuntimeError(
+                            f"Mininet cleanup failed after {stop_error}: {detail}"
+                        ) from stop_error
+        finally:
+            if runtime_dir is not None:
+                runtime_dir.cleanup()
 
     def __enter__(self):
         return self.start()
