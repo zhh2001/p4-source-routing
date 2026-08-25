@@ -3,7 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from scapy.all import Ether, IP, UDP
+from scapy.all import Ether, IP, TCP, UDP
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,10 +13,16 @@ from source_route import (  # noqa: E402
     ETHERTYPE_IPV4,
     ETHERTYPE_SOURCE_ROUTE,
     PATHS,
+    TCP_ACKNOWLEDGMENT,
+    TCP_DESTINATION_PORT,
+    TCP_SEQUENCE,
+    TCP_SOURCE_PORT,
+    TCP_WINDOW,
     UDP_DESTINATION_PORT,
     UDP_SOURCE_PORT,
     SourceRouteHeader,
     build_packet,
+    build_tcp_packet,
     packet_payload,
     send_frame,
 )
@@ -91,6 +97,35 @@ class SourceRoutePacketTest(unittest.TestCase):
             packet[SourceRouteHeader].getfieldval("ports"),
             [3, 1, 1],
         )
+
+    def test_serialized_tcp_packet(self):
+        token = "tcp-builder"
+        packet = build_tcp_packet("upper", token)
+        serialized = bytes(packet)
+        ipv4 = packet[IP]
+        tcp = packet[TCP]
+
+        self.assertEqual(ipv4.proto, socket.IPPROTO_TCP)
+        self.assertEqual(ipv4.len, 20 + 20 + len(packet_payload(token)))
+        self.assertEqual(tcp.sport, TCP_SOURCE_PORT)
+        self.assertEqual(tcp.dport, TCP_DESTINATION_PORT)
+        self.assertEqual(tcp.seq, TCP_SEQUENCE)
+        self.assertEqual(tcp.ack, TCP_ACKNOWLEDGMENT)
+        self.assertEqual(int(tcp.flags), 0x18)
+        self.assertEqual(tcp.dataofs, 5)
+        self.assertEqual(tcp.window, TCP_WINDOW)
+        self.assertEqual(bytes(tcp.payload), packet_payload(token))
+        self.assertNotEqual(tcp.chksum, 0)
+
+        ip_offset = 14 + 3 + len(PATHS["upper"]["route"])
+        tcp_segment = serialized[ip_offset + 20 : ip_offset + ipv4.len]
+        pseudo_header = (
+            socket.inet_aton(ipv4.src)
+            + socket.inet_aton(ipv4.dst)
+            + bytes((0, ipv4.proto))
+            + len(tcp_segment).to_bytes(2, "big")
+        )
+        self.assertEqual(internet_checksum(pseudo_header + tcp_segment), 0)
 
     def test_explicit_source_route_encoding(self):
         packet = build_packet(

@@ -21,9 +21,15 @@ from source_route import (  # noqa: E402
     ETHERTYPE_IPV4,
     ETHERTYPE_SOURCE_ROUTE,
     PATHS,
+    TCP_ACKNOWLEDGMENT,
+    TCP_DESTINATION_PORT,
+    TCP_SEQUENCE,
+    TCP_SOURCE_PORT,
+    TCP_WINDOW,
     UDP_DESTINATION_PORT,
     UDP_SOURCE_PORT,
     build_packet,
+    build_tcp_packet,
     packet_payload,
 )
 
@@ -86,10 +92,18 @@ class Observation:
     ip_src: str
     ip_dst: str
     transport: bytes
-    udp_source: int
-    udp_destination: int
-    udp_length: int
-    udp_checksum: int
+    udp_source: int | None
+    udp_destination: int | None
+    udp_length: int | None
+    udp_checksum: int | None
+    tcp_source: int | None
+    tcp_destination: int | None
+    tcp_sequence: int | None
+    tcp_acknowledgment: int | None
+    tcp_header_length: int | None
+    tcp_flags: int | None
+    tcp_window: int | None
+    tcp_checksum: int | None
     payload: bytes
 
 
@@ -166,13 +180,42 @@ def decode_frame(frame, require_complete=True):
     ip_end = min(len(frame), ip_offset + ip_total_length)
     transport = frame[ip_offset + ihl : ip_end]
     ip_protocol = frame[ip_offset + 9]
-    if ip_protocol != socket.IPPROTO_UDP or len(transport) < 8:
-        raise ValueError("packet is not UDP")
-    udp_source, udp_destination, udp_length, udp_checksum = struct.unpack_from(
-        "!HHHH", transport
-    )
-    if udp_length < 8 or udp_length > len(transport):
-        raise ValueError("invalid UDP length")
+    udp_source = None
+    udp_destination = None
+    udp_length = None
+    udp_checksum = None
+    tcp_source = None
+    tcp_destination = None
+    tcp_sequence = None
+    tcp_acknowledgment = None
+    tcp_header_length = None
+    tcp_flags = None
+    tcp_window = None
+    tcp_checksum = None
+    if ip_protocol == socket.IPPROTO_UDP:
+        if len(transport) < 8:
+            raise ValueError("truncated UDP header")
+        udp_source, udp_destination, udp_length, udp_checksum = struct.unpack_from(
+            "!HHHH", transport
+        )
+        if udp_length < 8 or udp_length > len(transport):
+            raise ValueError("invalid UDP length")
+        payload = transport[8:udp_length]
+    elif ip_protocol == socket.IPPROTO_TCP:
+        if len(transport) < 20:
+            raise ValueError("truncated TCP header")
+        tcp_source, tcp_destination, tcp_sequence, tcp_acknowledgment = (
+            struct.unpack_from("!HHII", transport)
+        )
+        tcp_header_length = (transport[12] >> 4) * 4
+        if tcp_header_length < 20 or tcp_header_length > len(transport):
+            raise ValueError("invalid TCP header length")
+        tcp_flags = transport[13]
+        tcp_window = int.from_bytes(transport[14:16], "big")
+        tcp_checksum = int.from_bytes(transport[16:18], "big")
+        payload = transport[tcp_header_length:]
+    else:
+        raise ValueError(f"unsupported IPv4 protocol {ip_protocol}")
 
     return Observation(
         frame=frame,
@@ -199,7 +242,15 @@ def decode_frame(frame, require_complete=True):
         udp_destination=udp_destination,
         udp_length=udp_length,
         udp_checksum=udp_checksum,
-        payload=transport[8:udp_length],
+        tcp_source=tcp_source,
+        tcp_destination=tcp_destination,
+        tcp_sequence=tcp_sequence,
+        tcp_acknowledgment=tcp_acknowledgment,
+        tcp_header_length=tcp_header_length,
+        tcp_flags=tcp_flags,
+        tcp_window=tcp_window,
+        tcp_checksum=tcp_checksum,
+        payload=payload,
     )
 
 
@@ -221,6 +272,31 @@ def matches_frame(frame, path, payload, require_complete=True):
     except ValueError:
         return False
     return matches_packet(observation, path, payload)
+
+
+def matches_tcp_packet(observation, path, payload):
+    return (
+        observation.ip_src == path["src_ip"]
+        and observation.ip_dst == path["dst_ip"]
+        and observation.ip_identification == 0x1234
+        and observation.ip_protocol == socket.IPPROTO_TCP
+        and observation.tcp_source == TCP_SOURCE_PORT
+        and observation.tcp_destination == TCP_DESTINATION_PORT
+        and observation.tcp_sequence == TCP_SEQUENCE
+        and observation.tcp_acknowledgment == TCP_ACKNOWLEDGMENT
+        and observation.tcp_header_length == 20
+        and observation.tcp_flags == 0x18
+        and observation.tcp_window == TCP_WINDOW
+        and observation.payload == payload
+    )
+
+
+def matches_tcp_frame(frame, path, payload):
+    try:
+        observation = decode_frame(frame)
+    except ValueError:
+        return False
+    return matches_tcp_packet(observation, path, payload)
 
 
 def contains_ipv4_identity(frame, path, payload):
@@ -286,6 +362,7 @@ class PacketPathTest(unittest.TestCase):
         matcher,
         expected_matches,
         allow_empty=False,
+        receiver_operation="receive",
     ):
         path = PATHS[path_name]
         receiver = None
@@ -310,7 +387,7 @@ class PacketPathTest(unittest.TestCase):
                 receiver_arguments = [
                     sys.executable,
                     str(ROOT / "tools" / "source_route.py"),
-                    "receive",
+                    receiver_operation,
                     path_name,
                     token,
                 ]
@@ -328,7 +405,7 @@ class PacketPathTest(unittest.TestCase):
                     stop_process(receiver)
                     _, receiver_error = receiver.communicate()
                     self.fail(
-                        f"token {token}: UDP receiver did not become ready: "
+                        f"token {token}: receiver did not become ready: "
                         f"{receiver_error.strip()}"
                     )
                 ready_line = receiver.stdout.readline().strip()
@@ -336,7 +413,7 @@ class PacketPathTest(unittest.TestCase):
                     stop_process(receiver)
                     _, receiver_error = receiver.communicate()
                     self.fail(
-                        f"token {token}: UDP receiver readiness was {ready_line!r}: "
+                        f"token {token}: receiver readiness was {ready_line!r}: "
                         f"{receiver_error.strip()}"
                     )
 
@@ -383,7 +460,7 @@ class PacketPathTest(unittest.TestCase):
                 receiver_output, receiver_error = receiver.communicate(timeout=3.0)
                 if receiver.returncode != 0:
                     self.fail(
-                        f"token {token}: UDP receiver failed with status "
+                        f"token {token}: receiver failed with status "
                         f"{receiver.returncode}: {receiver_error.strip()}"
                     )
                 delivered = [
@@ -405,6 +482,24 @@ class PacketPathTest(unittest.TestCase):
             ["send", path_name, token],
             lambda frame: matches_frame(frame, path, payload),
             expected_matches=4,
+        )
+        observations = {
+            link: [decode_frame(frame) for frame in frames]
+            for link, frames in capture.links.items()
+        }
+        return PathCapture(observations, capture.delivered_payloads)
+
+    def capture_tcp_path(self, path_name, token):
+        path = PATHS[path_name]
+        payload = packet_payload(token)
+        packet = build_tcp_packet(path_name, token)
+        capture = self.capture_case(
+            path_name,
+            token,
+            ["send-raw", path_name, bytes(packet).hex()],
+            lambda frame: matches_tcp_frame(frame, path, payload),
+            expected_matches=len(EXPECTED_PATHS[path_name]),
+            receiver_operation="receive-tcp",
         )
         observations = {
             link: [decode_frame(frame) for frame in frames]
@@ -606,6 +701,99 @@ class PacketPathTest(unittest.TestCase):
         self.assertEqual(len({item.udp_checksum for item in ordered}), 1)
         self.assertEqual(len({item.ip_checksum for item in ordered}), 4)
 
+    def assert_tcp_path(self, path_name, token, capture):
+        path = PATHS[path_name]
+        expected_payload = packet_payload(token)
+        expected_states = EXPECTED_PATHS[path_name]
+        expected_links = {link for link, _, _ in expected_states}
+
+        for link, observed in capture.links.items():
+            expected_count = 1 if link in expected_links else 0
+            self.assertEqual(
+                len(observed),
+                expected_count,
+                f"token {token} on {link}: got {len(observed)}, want {expected_count}",
+            )
+        self.assertEqual(
+            capture.delivered_payloads,
+            [expected_payload],
+            f"token {token}: final TCP delivery count or payload differs",
+        )
+
+        ordered = []
+        for link, expected_route, expected_ttl in expected_states:
+            observation = capture.links[link][0]
+            ordered.append(observation)
+            self.assertEqual(
+                observation.route,
+                expected_route,
+                f"token {token} on {link}: route stack",
+            )
+            self.assertEqual(
+                observation.ip_ttl,
+                expected_ttl,
+                f"token {token} on {link}: TTL",
+            )
+            self.assertEqual(observation.ethernet_src, path["src_mac"])
+            self.assertEqual(observation.ethernet_dst, path["dst_mac"])
+            self.assertEqual(observation.ip_src, path["src_ip"])
+            self.assertEqual(observation.ip_dst, path["dst_ip"])
+            self.assertEqual(observation.ip_identification, 0x1234)
+            self.assertEqual(observation.ip_ihl, 5)
+            self.assertEqual(observation.ip_protocol, socket.IPPROTO_TCP)
+            self.assertEqual(observation.tcp_source, TCP_SOURCE_PORT)
+            self.assertEqual(observation.tcp_destination, TCP_DESTINATION_PORT)
+            self.assertEqual(observation.tcp_sequence, TCP_SEQUENCE)
+            self.assertEqual(observation.tcp_acknowledgment, TCP_ACKNOWLEDGMENT)
+            self.assertEqual(observation.tcp_header_length, 20)
+            self.assertEqual(observation.tcp_flags, 0x18)
+            self.assertEqual(observation.tcp_window, TCP_WINDOW)
+            self.assertIsNotNone(observation.tcp_checksum)
+            self.assertNotEqual(observation.tcp_checksum, 0)
+            self.assertEqual(observation.payload, expected_payload)
+            self.assertEqual(
+                observation.ip_total_length, 20 + len(observation.transport)
+            )
+            self.assertEqual(internet_checksum(observation.ip_header), 0)
+            pseudo_header = (
+                socket.inet_aton(observation.ip_src)
+                + socket.inet_aton(observation.ip_dst)
+                + bytes((0, observation.ip_protocol))
+                + len(observation.transport).to_bytes(2, "big")
+            )
+            self.assertEqual(
+                internet_checksum(pseudo_header + observation.transport),
+                0,
+                f"token {token} on {link}: TCP checksum",
+            )
+
+            if expected_route is None:
+                self.assertEqual(observation.ethernet_type, ETHERTYPE_IPV4)
+                self.assertIsNone(observation.route_length)
+                expected_length = 14 + observation.ip_total_length
+            else:
+                self.assertEqual(
+                    observation.ethernet_type,
+                    ETHERTYPE_SOURCE_ROUTE,
+                )
+                self.assertEqual(observation.next_header, ETHERTYPE_IPV4)
+                self.assertEqual(observation.route_length, len(expected_route))
+                expected_length = (
+                    14 + 3 + len(expected_route) + observation.ip_total_length
+                )
+            self.assertEqual(len(observation.frame), expected_length)
+
+        normalized_headers = set()
+        for observation in ordered:
+            normalized = bytearray(observation.ip_header)
+            normalized[8] = 0
+            normalized[10:12] = b"\x00\x00"
+            normalized_headers.add(bytes(normalized))
+        self.assertEqual(len(normalized_headers), 1)
+        self.assertEqual(len({item.transport for item in ordered}), 1)
+        self.assertEqual(len({item.tcp_checksum for item in ordered}), 1)
+        self.assertEqual(len({item.ip_checksum for item in ordered}), 4)
+
     def test_forward_upper_and_lower_paths(self):
         upper_token = "forward-upper-1"
         lower_token = "forward-lower-1"
@@ -634,6 +822,11 @@ class PacketPathTest(unittest.TestCase):
         lower = self.capture_path("reverse-lower", lower_token)
         self.assert_path("reverse-upper", upper_token, upper)
         self.assert_path("reverse-lower", lower_token, lower)
+
+    def test_tcp_transparency_upper_path(self):
+        token = "tcp-upper-1"
+        capture = self.capture_tcp_path("upper", token)
+        self.assert_tcp_path("upper", token, capture)
 
     def test_invalid_output_ports_drop(self):
         cases = (

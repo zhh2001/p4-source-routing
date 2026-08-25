@@ -4,7 +4,7 @@ import argparse
 import socket
 import time
 
-from scapy.all import Ether, IP, UDP, bind_layers, sendp
+from scapy.all import Ether, IP, TCP, UDP, bind_layers, sendp
 from scapy.fields import ByteField, FieldLenField, FieldListField, XShortEnumField
 from scapy.packet import Packet
 
@@ -13,6 +13,11 @@ ETHERTYPE_IPV4 = 0x0800
 ETHERTYPE_SOURCE_ROUTE = 0x88B5
 UDP_SOURCE_PORT = 12000
 UDP_DESTINATION_PORT = 22000
+TCP_SOURCE_PORT = 13000
+TCP_DESTINATION_PORT = 23000
+TCP_SEQUENCE = 0x10203040
+TCP_ACKNOWLEDGMENT = 0x50607080
+TCP_WINDOW = 4096
 
 PATHS = {
     "upper": {
@@ -90,9 +95,10 @@ def packet_payload(token):
     return b"source-route|" + token_bytes(token) + b"|" + bytes(range(32))
 
 
-def build_packet(
+def _build_packet(
     path_name,
     token,
+    transport,
     ttl=64,
     *,
     route=None,
@@ -135,10 +141,49 @@ def build_packet(
             ports=list(route),
         )
         / IP(**ip_fields)
-        / UDP(sport=UDP_SOURCE_PORT, dport=UDP_DESTINATION_PORT)
+        / transport
         / packet_payload(token)
     )
     return Ether(bytes(packet))
+
+
+def build_packet(
+    path_name,
+    token,
+    ttl=64,
+    *,
+    route=None,
+    route_length=None,
+    next_header=ETHERTYPE_IPV4,
+    ipv4_fields=None,
+):
+    return _build_packet(
+        path_name,
+        token,
+        UDP(sport=UDP_SOURCE_PORT, dport=UDP_DESTINATION_PORT),
+        ttl,
+        route=route,
+        route_length=route_length,
+        next_header=next_header,
+        ipv4_fields=ipv4_fields,
+    )
+
+
+def build_tcp_packet(path_name, token, ttl=64, *, route=None):
+    return _build_packet(
+        path_name,
+        token,
+        TCP(
+            sport=TCP_SOURCE_PORT,
+            dport=TCP_DESTINATION_PORT,
+            seq=TCP_SEQUENCE,
+            ack=TCP_ACKNOWLEDGMENT,
+            flags="PA",
+            window=TCP_WINDOW,
+        ),
+        ttl,
+        route=route,
+    )
 
 
 def send_packet(path_name, token, ttl=64, interface=None):
@@ -197,6 +242,70 @@ def receive_payloads(path_name, token, timeout=2.0, quiet_time=0.2):
     return matches
 
 
+def receive_tcp_payloads(path_name, token, timeout=2.0, quiet_time=0.2):
+    if timeout <= 0 or quiet_time <= 0:
+        raise ValueError("receive timeouts must be positive")
+    path = PATHS[path_name]
+    expected_payload = packet_payload(token)
+    matches = []
+    quiet_deadline = None
+
+    with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP) as receiver:
+        receiver.bind((path["dst_ip"], 0))
+        print("READY", flush=True)
+        hard_deadline = time.monotonic() + timeout
+        while True:
+            deadline = quiet_deadline or hard_deadline
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            receiver.settimeout(remaining)
+            try:
+                packet, _ = receiver.recvfrom(65535)
+            except socket.timeout:
+                break
+
+            if len(packet) < 40 or packet[0] != 0x45:
+                continue
+            total_length = int.from_bytes(packet[2:4], "big")
+            if total_length < 40 or len(packet) < total_length:
+                continue
+            if int.from_bytes(packet[4:6], "big") != 0x1234:
+                continue
+            if packet[9] != socket.IPPROTO_TCP:
+                continue
+            if socket.inet_ntoa(packet[12:16]) != path["src_ip"]:
+                continue
+            if socket.inet_ntoa(packet[16:20]) != path["dst_ip"]:
+                continue
+
+            tcp = packet[20:total_length]
+            if len(tcp) < 20:
+                continue
+            source = int.from_bytes(tcp[0:2], "big")
+            destination = int.from_bytes(tcp[2:4], "big")
+            sequence = int.from_bytes(tcp[4:8], "big")
+            acknowledgment = int.from_bytes(tcp[8:12], "big")
+            header_length = (tcp[12] >> 4) * 4
+            if source != TCP_SOURCE_PORT or destination != TCP_DESTINATION_PORT:
+                continue
+            if sequence != TCP_SEQUENCE or acknowledgment != TCP_ACKNOWLEDGMENT:
+                continue
+            if header_length != 20 or tcp[13] != 0x18:
+                continue
+            if int.from_bytes(tcp[14:16], "big") != TCP_WINDOW:
+                continue
+            if tcp[header_length:] != expected_payload:
+                continue
+
+            matches.append(expected_payload)
+            quiet_deadline = min(
+                hard_deadline,
+                time.monotonic() + quiet_time,
+            )
+    return matches
+
+
 def _frame_bytes(value):
     try:
         return bytes.fromhex(value)
@@ -224,6 +333,12 @@ def _parse_args():
     receiver.add_argument("--timeout", default=2.0, type=float)
     receiver.add_argument("--quiet-time", default=0.2, type=float)
     receiver.add_argument("--allow-empty", action="store_true")
+
+    tcp_receiver = subparsers.add_parser("receive-tcp")
+    tcp_receiver.add_argument("path", choices=PATHS)
+    tcp_receiver.add_argument("token")
+    tcp_receiver.add_argument("--timeout", default=2.0, type=float)
+    tcp_receiver.add_argument("--quiet-time", default=0.2, type=float)
     return parser.parse_args()
 
 
@@ -239,16 +354,26 @@ def main():
         print(f"sent {sent} raw bytes on {interface}")
         return
 
-    matches = receive_payloads(
-        args.path,
-        args.token,
-        timeout=args.timeout,
-        quiet_time=args.quiet_time,
-    )
+    if args.operation == "receive":
+        matches = receive_payloads(
+            args.path,
+            args.token,
+            timeout=args.timeout,
+            quiet_time=args.quiet_time,
+        )
+        allow_empty = args.allow_empty
+    else:
+        matches = receive_tcp_payloads(
+            args.path,
+            args.token,
+            timeout=args.timeout,
+            quiet_time=args.quiet_time,
+        )
+        allow_empty = False
     for payload in matches:
         print(payload.hex())
-    if not matches and not args.allow_empty:
-        raise SystemExit("no matching UDP payload received")
+    if not matches and not allow_empty:
+        raise SystemExit("no matching payload received")
 
 
 if __name__ == "__main__":
