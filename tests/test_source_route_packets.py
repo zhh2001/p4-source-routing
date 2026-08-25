@@ -18,6 +18,7 @@ from source_route import (  # noqa: E402
     SourceRouteHeader,
     build_packet,
     packet_payload,
+    send_frame,
 )
 
 
@@ -91,6 +92,56 @@ class SourceRoutePacketTest(unittest.TestCase):
             [3, 1, 1],
         )
 
+    def test_explicit_source_route_encoding(self):
+        packet = build_packet(
+            "upper",
+            "custom-header",
+            ttl=2,
+            route=(2, 3, 1, 7),
+            route_length=4,
+            next_header=0x86DD,
+            ipv4_fields={"flags": "MF"},
+        )
+        serialized = bytes(packet)
+        ip_offset = 17 + 4
+
+        self.assertEqual(serialized[14:17], b"\x86\xdd\x04")
+        self.assertEqual(serialized[17:ip_offset], b"\x02\x03\x01\x07")
+        self.assertEqual(serialized[ip_offset] >> 4, 4)
+        self.assertEqual(serialized[ip_offset + 8], 2)
+        self.assertEqual(
+            int.from_bytes(serialized[ip_offset + 6 : ip_offset + 8], "big") & 0x2000,
+            0x2000,
+        )
+        self.assertEqual(
+            internet_checksum(serialized[ip_offset : ip_offset + 20]),
+            0,
+        )
+
+    def test_route_length_boundaries_can_be_serialized(self):
+        empty = bytes(
+            build_packet(
+                "upper",
+                "empty-route",
+                route=(),
+                route_length=0,
+            )
+        )
+        oversized = bytes(
+            build_packet(
+                "upper",
+                "oversized-route",
+                route=(2, 2, 1, 1, 1, 1, 1, 1, 1),
+                route_length=9,
+            )
+        )
+
+        self.assertEqual(empty[16], 0)
+        self.assertEqual(empty[17] >> 4, 4)
+        self.assertEqual(oversized[16], 9)
+        self.assertEqual(oversized[17:26], bytes((2, 2, 1, 1, 1, 1, 1, 1, 1)))
+        self.assertEqual(oversized[26] >> 4, 4)
+
     def test_rejects_invalid_input(self):
         with self.assertRaisesRegex(ValueError, "unknown path"):
             build_packet("missing", "token")
@@ -98,6 +149,16 @@ class SourceRoutePacketTest(unittest.TestCase):
             build_packet("upper", "")
         with self.assertRaisesRegex(ValueError, "0..255"):
             build_packet("upper", "token", ttl=256)
+        with self.assertRaisesRegex(ValueError, "route ports"):
+            build_packet("upper", "token", route=(256,))
+        with self.assertRaisesRegex(ValueError, "route length"):
+            build_packet("upper", "token", route_length=256)
+        with self.assertRaisesRegex(ValueError, "next header"):
+            build_packet("upper", "token", next_header=0x10000)
+        with self.assertRaisesRegex(TypeError, "frame must be bytes"):
+            send_frame("frame", "missing-interface")
+        with self.assertRaisesRegex(ValueError, "at least 14"):
+            send_frame(b"short", "missing-interface")
 
 
 if __name__ == "__main__":
