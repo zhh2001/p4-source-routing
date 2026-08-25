@@ -25,16 +25,20 @@ test: test-unit test-integration
 test-unit: build
 	PYTHONPYCACHEPREFIX=$(BUILD_DIR)/pycache $(PYTHON) -m py_compile \
 		mininet/topology.py tests/test_p4_structure.py tests/test_topology.py \
-		tests/test_mininet_runtime.py
+		tests/test_mininet_runtime.py tools/source_route.py \
+		tests/test_source_route_packets.py tests/test_packet_paths.py
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s tests \
 		-p 'test_p4_structure.py' -v
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s tests \
 		-p 'test_topology.py' -v
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s tests \
+		-p 'test_source_route_packets.py' -v
 	$(GO) test ./...
 	$(GO) vet ./...
 
 test-integration: build
 	$(SUDO) env PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tests/test_mininet_runtime.py
+	$(SUDO) env PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tests/test_packet_paths.py
 
 clean:
 	rm -rf -- ./build
